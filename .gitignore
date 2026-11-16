@@ -1,0 +1,10 @@
+# sistema
+.DS_Store
+.idea/
+
+# datos con permanencia (no se versionan)
+/data/
+/uploads/
+
+# dependencias opcionales (PHPMailer vía Composer)
+/vendor/

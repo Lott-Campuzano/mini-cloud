@@ -1,36 +1,73 @@
 <?php
+/**
+ * Subida de archivos al repositorio colectivo.
+ *
+ * Acepta uno o varios archivos en el campo "file[]" (input multiple);
+ * también acepta el campo simple "file" para compatibilidad.
+ * Cada archivo se guarda en disco por su hash SHA-256 (content-addressed):
+ * si el mismo contenido ya existe, se reutiliza y no se duplica nada.
+ * El registro vive en la tabla `archivos`, visible para todos los usuarios.
+ */
 
-header('Content-Type: application/json');
+require __DIR__ . '/config.php';
 
-$uploadDir = __DIR__ . '/uploads/';
-$relativePath = 'uploads/';
+header('Content-Type: application/json; charset=utf-8');
 
-if (!file_exists($uploadDir)) {
-    mkdir($uploadDir,0777,true);
-}
+$usuario = exigir_sesion();
 
 try {
     if (!isset($_FILES['file'])) {
-        throw new Exception( 'No se recibió ningún archivo');
+        throw new Exception('No se recibió ningún archivo');
     }
 
-    $file = $_FILES['file'];
+    // Con <input multiple> PHP entrega arrays por cada campo.
+    $nombres = $_FILES['file']['name'];
+    $esMultiple = is_array($nombres);
+    $cantidad = $esMultiple ? count($nombres) : 1;
 
-    if ($file['error'] !== UPLOAD_ERR_OK) {
-        throw new Exception('Error al subir el archivo');
+    $subidos = [];
+    $errores = [];
+
+    for ($i = 0; $i < $cantidad; $i++) {
+        $error = $esMultiple ? $_FILES['file']['error'][$i] : $_FILES['file']['error'];
+        $tmp   = $esMultiple ? $_FILES['file']['tmp_name'][$i] : $_FILES['file']['tmp_name'];
+
+        if ($error !== UPLOAD_ERR_OK) {
+            $errores[] = "Archivo " . ($i + 1) . ": error de subida (código $error)";
+            continue;
+        }
+
+        $hash = hash_file('sha256', $tmp);
+        $nombre = basename((string) ($esMultiple ? $nombres[$i] : $nombres));
+        if ($nombre === '') {
+            $nombre = 'archivo-' . substr($hash, 0, 8);
+        }
+        $tamano = (int) filesize($tmp);
+
+        $destino = ruta_de_hash($hash);
+        if ($destino === null) {
+            $errores[] = "Hash inválido para el archivo " . ($i + 1);
+            continue;
+        }
+
+        if (!is_file($destino) && !move_uploaded_file($tmp, $destino)) {
+            $errores[] = "No se pudo guardar \"$nombre\"";
+            continue;
+        }
+
+        registrar_archivo($hash, $nombre, $tamano, $usuario);
+        $subidos[] = ['hash' => $hash, 'nombre' => $nombre, 'tamano' => $tamano];
     }
 
-    $safeName = preg_replace( '/[^a-zA-Z0-9.\-_]/', '', basename($file['name']));
-    $targetPath = $uploadDir . $safeName;
-
-    if (move_uploaded_file($file['tmp_name'], $targetPath)) {
-        echo json_encode(['success' => true, 'filename' => $safeName, 'path' => $relativePath . $safeName]);
-    } else {
-        throw new Exception( 'Error al mover el archivo');
+    if ($subidos === [] && $errores !== []) {
+        responder_error($errores[0]);
     }
-} catch (Exception $e) {
-    http_response_code( 400);
-    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
+
+    echo json_encode([
+        'success' => true,
+        'files'   => $subidos,
+        'errores' => $errores,
+    ], JSON_UNESCAPED_UNICODE);
+} catch (Throwable $e) {
+    responder_error($e->getMessage());
 }
-
-?>

@@ -1,31 +1,40 @@
 <?php
+/** Borrado de un archivo del repositorio (solo quien lo subió). */
 
-header('Content-Type: application/json');
+require __DIR__ . '/config.php';
 
-$uploadDir = __DIR__ . '/uploads/';
+header('Content-Type: application/json; charset=utf-8');
+
+$usuario = exigir_sesion();
 
 try {
-    $data = json_decode(file_get_contents('php://input'), true);
+    $data = json_decode(file_get_contents('php://input') ?: '[]', true);
+    $hash = (string) ($data['hash'] ?? '');
 
-    if (!isset($data['filename'])) {
-        throw new Exception('Nombre de archivo no especificado');
+    $ruta = ruta_de_hash($hash);
+    if ($ruta === null) {
+        throw new Exception('Hash inválido');
     }
 
-    $safeName = basename($data['filename']);
-    $filePath = $uploadDir . $safeName;
+    $stmt = db()->prepare('SELECT subido_por FROM archivos WHERE hash = :hash');
+    $stmt->execute(['hash' => $hash]);
+    $fila = $stmt->fetch();
 
-    if (!file_exists($filePath)) {
+    if (!$fila) {
         throw new Exception('El archivo no existe');
     }
-
-    if (unlink($filePath)) {
-        echo json_encode(['success' => true, 'message' => 'Archivo eliminado correctamente']);
-    } else {
-        throw new Exception( 'Error al eliminar el archivo');
+    if ($fila['subido_por'] !== $usuario) {
+        throw new Exception('Solo quien subió el archivo puede borrarlo', 403);
     }
-} catch (Exception $e) {
-    http_response_code( 400);
-    echo json_encode(['success' => false, 'error' => $e->getMessage()]);
-}
 
-?>
+    $stmt = db()->prepare('DELETE FROM archivos WHERE hash = :hash');
+    $stmt->execute(['hash' => $hash]);
+
+    if (is_file($ruta) && !unlink($ruta)) {
+        throw new Exception('Error al eliminar el archivo del disco');
+    }
+
+    echo json_encode(['success' => true, 'message' => 'Archivo eliminado correctamente']);
+} catch (Throwable $e) {
+    responder_error($e->getMessage(), (int) ($e->getCode() ?: 400));
+}

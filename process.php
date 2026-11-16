@@ -1,175 +1,204 @@
 <?php
-session_start();
-use PHPMailer\PHPMailer\PHPMailer;
-use PHPMailer\PHPMailer\Exception;
+/**
+ * Login (dos pasos) y verificación del token.
+ *
+ * Paso 1 · POST login=1 con usuario y contraseña.
+ *   - Si la contraseña es correcta se genera un token, se guarda en la
+ *     base de datos y se entrega al usuario (por correo si hay SMTP
+ *     configurado en el entorno; en local se muestra en pantalla).
+ *   - Redirige a verificar.php.
+ *
+ * Paso 2 · POST verificar=1 con usuario, token y el campo CSRF token-u.
+ *   - Al verificar se inicia la sesión y entra a index.php.
+ */
 
-require '/proyecto/vendor/autoload.php';
+require __DIR__ . '/config.php';
 
-// Configuración de base de datos
-$dsn = 'mysql:host=localhost;dbname=mi_base';
-$db_user = 'user';
-$db_pass = 'pass';
+$ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
 
-try {
-    $pdo = new PDO($dsn, $db_user, $db_pass);
-    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch (PDOException $e) {
-    die("Error de conexión: " . $e->getMessage());
-}
-
-$ip = $_SERVER['REMOTE_ADDR'];
-
-// ========================
-// FUNCIONES AUXILIARES
-// ========================
-
-// Verifica si la IP está bloqueada
-function is_ip_blocked($pdo, $ip) {
-    $stmt = $pdo->prepare("SELECT * FROM ips_bloqueadas WHERE ip = :ip");
+/** ¿La IP está bloqueada? Muestra el aviso y corta si lo está. */
+function is_ip_blocked(PDO $pdo, string $ip): ?array
+{
+    $stmt = $pdo->prepare('SELECT * FROM ips_bloqueadas WHERE ip = :ip');
     $stmt->execute(['ip' => $ip]);
-    $ip_data = $stmt->fetch(PDO::FETCH_ASSOC);
-    $now = new DateTime();
+    $ip_data = $stmt->fetch();
 
-    if ($ip_data && $ip_data['bloqueado_hasta'] && $now < new DateTime($ip_data['bloqueado_hasta'])) {
-        $_SESSION['verificar'] = "Tu IP ha sido bloqueada hasta: " . $ip_data['bloqueado_hasta'];
-        echo "<p>Tu IP ha sido bloqueada hasta: " . htmlspecialchars($ip_data['bloqueado_hasta']) . "</p>";
+    if ($ip_data && $ip_data['bloqueado_hasta'] && ahora() < $ip_data['bloqueado_hasta']) {
+        $_SESSION['verificar'] = 'Tu IP ha sido bloqueada hasta: ' . $ip_data['bloqueado_hasta'];
+        header('Location: verificar.php');
         exit;
     }
-    return $ip_data;
+    return $ip_data ?: null;
 }
 
-// Genera token seguro
-function generar_token() {
-    return bin2hex(random_bytes(32));
-}
+/** Entrega el token: por correo si hay SMTP, en pantalla si no. */
+function entregar_token(string $email, string $user, string $token): void
+{
+    $smtp = smtp_config();
 
-// Envía token al correo del usuario
-function send_token_email($email, $user, $token) {
-    $mail = new PHPMailer(true);
-    try {
-        $mail->isSMTP();
-        $mail->Host = 'smtp.gmail.com';
-        $mail->SMTPAuth = true;
-        $mail->Username = 'lottocampuzano@gmail.com';
-        $mail->Password = 'fycz bhkj cbmr yclh'; // Usa variable de entorno o archivo seguro en producción
-        $mail->SMTPSecure = 'tls';
-        $mail->Port = 587;
-
-        $mail->setFrom('lottocampuzano@gmail.com', 'Gmail');
-        $mail->addAddress($email, $user);
-        $mail->isHTML(true);
-        $mail->Subject = 'Tu token de acceso';
-        $mail->Body = "Hola <strong>$user</strong>, tu token es: <b>$token</b>";
-        $mail->send();
-        echo "Se ha enviado el token a tu correo.";
-    } catch (Exception $e) {
-        echo "Error al enviar el token: " . $mail->ErrorInfo;
+    if ($smtp) {
+        $autoload = __DIR__ . '/vendor/autoload.php';
+        if (is_file($autoload)) {
+            require $autoload;
+            $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
+            try {
+                $mail->isSMTP();
+                $mail->Host       = $smtp['host'];
+                $mail->SMTPAuth   = true;
+                $mail->Username   = $smtp['user'];
+                $mail->Password   = $smtp['pass'];
+                $mail->SMTPSecure = \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+                $mail->Port       = $smtp['port'];
+                $mail->setFrom($smtp['from'], 'proyecto SAW');
+                $mail->addAddress($email, $user);
+                $mail->isHTML(true);
+                $mail->Subject = 'Tu token de acceso';
+                $mail->Body    = "Hola <strong>" . htmlspecialchars($user) . "</strong>, tu token es: <b>$token</b>";
+                $mail->send();
+                $_SESSION['msg'] = 'Se ha enviado el token a tu correo.';
+                return;
+            } catch (\Throwable $e) {
+                // Sin correo disponible: cae al modo local.
+            }
+        }
     }
+
+    // Modo local: el token se muestra en la página de verificación.
+    $_SESSION['token-mostrar'] = $token;
 }
 
-// ========================
-// LOGIN
-// ========================
-if (isset($_POST["login"])) {
-    $user = filter_input(INPUT_POST, 'usuario', FILTER_SANITIZE_FULL_SPECIAL_CHARS);
-    $pass = $_POST['contraseña'];
-    $_SESSION['token-u'] = bin2hex(random_bytes(32)); // Token CSRF
+$pdo = db();
+
+if (isset($_POST['login'])) {
+    $user = trim((string) filter_input(INPUT_POST, 'usuario', FILTER_DEFAULT));
+    $pass = (string) ($_POST['contraseña'] ?? '');
+
+    if ($user === '' || $pass === '') {
+        $_SESSION['verificar'] = 'Usuario y contraseña obligatorios.';
+        header('Location: login.php');
+        exit;
+    }
+
+    $_SESSION['token-u'] = bin2hex(random_bytes(32)); // Token CSRF del paso de verificación
 
     $ip_data = is_ip_blocked($pdo, $ip);
 
-    // Verificar existencia del usuario
-    $stmt = $pdo->prepare("SELECT * FROM usuarios WHERE usr = :usuario");
+    $stmt = $pdo->prepare('SELECT * FROM usuarios WHERE usr = :usuario');
     $stmt->execute(['usuario' => $user]);
-    $usuario = $stmt->fetch(PDO::FETCH_ASSOC);
+    $usuario = $stmt->fetch();
 
-    $now = new DateTime();
-    if ($usuario && $usuario['tiempo'] && $now < new DateTime($usuario['tiempo'])) {
-        echo "El usuario está bloqueado hasta: " . htmlspecialchars($usuario['tiempo']);
+    if ($usuario && $usuario['tiempo'] && ahora() < $usuario['tiempo']) {
+        $_SESSION['verificar'] = 'El usuario está bloqueado hasta: ' . $usuario['tiempo'];
+        header('Location: login.php');
         exit;
     }
 
     if ($usuario && password_verify($pass, $usuario['pass'])) {
-        // Login exitoso
-        $token = generar_token();
-        $stmt = $pdo->prepare("UPDATE usuarios SET token = :token, intento = 0, tiempo = NULL WHERE usr = :usuario");
+        // Login correcto: token nuevo, intentos en cero, IP sin deuda.
+        $token = bin2hex(random_bytes(32));
+        $stmt = $pdo->prepare(
+            'UPDATE usuarios SET token = :token, intento = 0, tiempo = NULL WHERE usr = :usuario'
+        );
         $stmt->execute(['token' => $token, 'usuario' => $user]);
 
-        send_token_email($usuario['email'], $user, $token);
+        entregar_token($usuario['email'] ?? '', $user, $token);
 
         if ($ip_data) {
-            $stmt = $pdo->prepare("UPDATE ips_bloqueadas SET intentos = 0, bloqueado_hasta = NULL WHERE ip = :ip");
+            $stmt = $pdo->prepare(
+                'UPDATE ips_bloqueadas SET intentos = 0, bloqueado_hasta = NULL WHERE ip = :ip'
+            );
             $stmt->execute(['ip' => $ip]);
         }
 
-        header("Location: /interfaz/verificar.php");
+        header('Location: verificar.php');
         exit;
-    } else {
-        $usuario_intentos = $usuario ? $usuario['intento'] + 1 : 0;
-        $ip_intentos = $ip_data ? $ip_data['intentos'] + 1 : 1;
-
-        // Bloqueo por usuario
-        if ($usuario && $usuario_intentos >= 5) {
-            $bloqueo_usuario = (new DateTime('+10 minutes'))->format('Y-m-d H:i:s');
-            $stmt = $pdo->prepare("UPDATE usuarios SET intento = :intento, tiempo = :tiempo WHERE usr = :usuario");
-            $stmt->execute(['intento' => $usuario_intentos, 'tiempo' => $bloqueo_usuario, 'usuario' => $user]);
-            echo "Usuario bloqueado por múltiples intentos fallidos.";
-            exit;
-        } elseif ($usuario) {
-            $stmt = $pdo->prepare("UPDATE usuarios SET intento = :intento WHERE usr = :usuario");
-            $stmt->execute(['intento' => $usuario_intentos, 'usuario' => $user]);
-        }
-
-        // Bloqueo por IP
-        if ($ip_intentos >= 10) {
-            $bloqueo_ip = (new DateTime('+10 minutes'))->format('Y-m-d H:i:s');
-            if ($ip_data) {
-                $stmt = $pdo->prepare("UPDATE ips_bloqueadas SET intentos = :intentos, bloqueado_hasta = :bloqueado WHERE ip = :ip");
-                $stmt->execute(['intentos' => $ip_intentos, 'bloqueado' => $bloqueo_ip, 'ip' => $ip]);
-            } else {
-                $stmt = $pdo->prepare("INSERT INTO ips_bloqueadas (ip, intentos, bloqueado_hasta) VALUES (:ip, :intentos, :bloqueado)");
-                $stmt->execute(['ip' => $ip, 'intentos' => $ip_intentos, 'bloqueado' => $bloqueo_ip]);
-            }
-            echo "IP bloqueada por múltiples intentos fallidos.";
-            exit;
-        } else {
-            if ($ip_data) {
-                $stmt = $pdo->prepare("UPDATE ips_bloqueadas SET intentos = :intentos WHERE ip = :ip");
-                $stmt->execute(['intentos' => $ip_intentos, 'ip' => $ip]);
-            } else {
-                $stmt = $pdo->prepare("INSERT INTO ips_bloqueadas (ip, intentos) VALUES (:ip, :intentos)");
-                $stmt->execute(['ip' => $ip, 'intentos' => $ip_intentos]);
-            }
-        }
-
-        echo "Contraseña incorrecta. Intentos restantes del usuario: " . max(0, 5 - $usuario_intentos) . ". Intentos restantes por IP: " . max(0, 10 - $ip_intentos);
     }
+
+    // Login fallido: cuenta intentos por usuario y por IP.
+    $usuario_intentos = $usuario ? (int) $usuario['intento'] + 1 : 0;
+    $ip_intentos      = $ip_data ? (int) $ip_data['intentos'] + 1 : 1;
+
+    if ($usuario && $usuario_intentos >= 5) {
+        $bloqueo = date('Y-m-d H:i:s', time() + 600);
+        $stmt = $pdo->prepare(
+            'UPDATE usuarios SET intento = :intento, tiempo = :tiempo WHERE usr = :usuario'
+        );
+        $stmt->execute(['intento' => $usuario_intentos, 'tiempo' => $bloqueo, 'usuario' => $user]);
+        $_SESSION['verificar'] = 'Usuario bloqueado por múltiples intentos fallidos (10 min).';
+        header('Location: login.php');
+        exit;
+    } elseif ($usuario) {
+        $stmt = $pdo->prepare('UPDATE usuarios SET intento = :intento WHERE usr = :usuario');
+        $stmt->execute(['intento' => $usuario_intentos, 'usuario' => $user]);
+    }
+
+    if ($ip_intentos >= 10) {
+        $bloqueo = date('Y-m-d H:i:s', time() + 600);
+        if ($ip_data) {
+            $stmt = $pdo->prepare(
+                'UPDATE ips_bloqueadas SET intentos = :intentos, bloqueado_hasta = :bloqueado WHERE ip = :ip'
+            );
+            $stmt->execute(['intentos' => $ip_intentos, 'bloqueado' => $bloqueo, 'ip' => $ip]);
+        } else {
+            $stmt = $pdo->prepare(
+                'INSERT INTO ips_bloqueadas (ip, intentos, bloqueado_hasta) VALUES (:ip, :intentos, :bloqueado)'
+            );
+            $stmt->execute(['ip' => $ip, 'intentos' => $ip_intentos, 'bloqueado' => $bloqueo]);
+        }
+        $_SESSION['verificar'] = 'IP bloqueada por múltiples intentos fallidos (10 min).';
+        header('Location: login.php');
+        exit;
+    }
+
+    if ($ip_data) {
+        $stmt = $pdo->prepare('UPDATE ips_bloqueadas SET intentos = :intentos WHERE ip = :ip');
+        $stmt->execute(['intentos' => $ip_intentos, 'ip' => $ip]);
+    } else {
+        $stmt = $pdo->prepare('INSERT INTO ips_bloqueadas (ip, intentos) VALUES (:ip, :intentos)');
+        $stmt->execute(['ip' => $ip, 'intentos' => $ip_intentos]);
+    }
+
+    $_SESSION['verificar'] = 'Contraseña incorrecta. Intentos restantes del usuario: '
+        . max(0, 5 - $usuario_intentos)
+        . '. Intentos restantes por IP: ' . max(0, 10 - $ip_intentos) . '.';
+    header('Location: login.php');
+    exit;
 }
 
 // ========================
-// VERIFICACIÓN DE TOKEN
+// VERIFICACIÓN DEL TOKEN
 // ========================
 if (isset($_POST['verificar'])) {
-    if (!isset($_SESSION['token-u']) || $_POST['token-u'] !== $_SESSION['token-u']) {
+    if (!isset($_SESSION['token-u']) || !hash_equals($_SESSION['token-u'], (string) ($_POST['token-u'] ?? ''))) {
         die('CSRF detectado');
     }
 
-    $username = $_POST["usuario"];
-    $token_ingresado = $_POST["token"];
+    $username       = trim((string) ($_POST['usuario'] ?? ''));
+    $token_ingresado = trim((string) ($_POST['token'] ?? ''));
 
-    $stmt = $pdo->prepare("SELECT * FROM usuarios WHERE usr = :username AND token = :token");
+    $stmt = $pdo->prepare('SELECT * FROM usuarios WHERE usr = :username AND token = :token');
     $stmt->execute(['username' => $username, 'token' => $token_ingresado]);
-    $result = $stmt->fetch(PDO::FETCH_ASSOC);
+    $result = $stmt->fetch();
 
     if ($result) {
-        echo "Bienvenido, $username";
+        // Sesión iniciada y token consumido.
+        $_SESSION['usuario'] = $username;
 
-        $stmt = $pdo->prepare("UPDATE usuarios SET token = NULL WHERE usr = :usuario");
+        $stmt = $pdo->prepare('UPDATE usuarios SET token = NULL, intento = 0, tiempo = NULL WHERE usr = :usuario');
         $stmt->execute(['usuario' => $username]);
 
-        $stmt = $pdo->prepare("DELETE FROM ips_bloqueadas WHERE ip = :ip");
+        $stmt = $pdo->prepare('DELETE FROM ips_bloqueadas WHERE ip = :ip');
         $stmt->execute(['ip' => $ip]);
-    } else {
-        echo "Token inválido";
+
+        unset($_SESSION['token-u'], $_SESSION['token-mostrar']);
+        header('Location: index.php');
+        exit;
     }
+
+    $_SESSION['verificar'] = 'Token inválido.';
+    header('Location: verificar.php');
+    exit;
 }
-?>
+
+header('Location: login.php');
+exit;
